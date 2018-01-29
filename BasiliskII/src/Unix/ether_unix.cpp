@@ -69,6 +69,10 @@
 #include "ctl.h"
 #endif
 
+#include <amqp.h>
+#include <amqp_tcp_socket.h>
+#include <amqp_ssl_socket.h>
+
 #include "cpu_emulation.h"
 #include "main.h"
 #include "macos_util.h"
@@ -93,7 +97,8 @@ enum {
 	NET_IF_SHEEPNET,
 	NET_IF_ETHERTAP,
 	NET_IF_TUNTAP,
-	NET_IF_SLIRP
+	NET_IF_SLIRP,
+	NET_IF_AMQP
 };
 
 // Constants
@@ -115,6 +120,9 @@ static pthread_t slirp_thread;				// Slirp reception thread
 static bool slirp_thread_active = false;	// Flag: Slirp reception threadinstalled
 static int slirp_output_fd = -1;			// fd of slirp output pipe
 static int slirp_input_fds[2] = { -1, -1 };	// fds of slirp input pipe
+static amqp_connection_state_t amqp_connection = 0;	// AMQP connection
+static amqp_envelope_t *amqp_envelope = 0;	// AMQP packet, saved here so it can be passed to the interrupt code
+static char amqp_exchange[128];				// AMQP exchange to publish upon
 #ifdef SHEEPSHAVER
 static bool net_open = false;				// Flag: initialization succeeded, network device open
 static uint8 ether_addr[6];					// Our Ethernet address
@@ -134,7 +142,8 @@ static int16 ether_do_write(uint32 arg);
 static void ether_do_interrupt(void);
 static void slirp_add_redirs();
 static int slirp_add_redir(const char *redir_str);
-
+amqp_connection_state_t amqp_queue_connect(const char *url);
+void amqp_queue_disconnect(amqp_connection_state_t connection);
 
 /*
  *  Start packet reception thread
@@ -250,6 +259,8 @@ bool ether_init(void)
 	else if (strcmp(name, "slirp") == 0)
 		net_if_type = NET_IF_SLIRP;
 #endif
+	else if (strncmp(name, "amqp", 4) == 0)
+		net_if_type = NET_IF_AMQP;
 	else
 		net_if_type = NET_IF_SHEEPNET;
 
@@ -287,6 +298,16 @@ bool ether_init(void)
 		slirp_add_redirs();
 	}
 #endif
+
+	if(net_if_type == NET_IF_AMQP) {
+		amqp_connection = amqp_queue_connect(name);
+		if(amqp_connection == 0)
+			return false;
+		// Start packet reception thread
+		if (!start_thread())
+			goto open_error;
+		return true; // return early to bypass fd setup
+	}
 
 	// Open sheep_net or ethertap or TUN/TAP device
 	char dev_name[16];
@@ -452,6 +473,13 @@ void ether_exit(void)
 	// Close slirp output buffer
 	if (slirp_output_fd > 0)
 		close(slirp_output_fd);
+
+	if(net_if_type == NET_IF_AMQP) {
+		if(amqp_connection != 0) {
+			amqp_queue_disconnect(amqp_connection);
+			amqp_connection = 0;
+		}
+	}
 
 #if STATISTICS
 	// Show statistics
@@ -751,6 +779,18 @@ static int16 ether_do_write(uint32 arg)
 		return noErr;
 	} else
 #endif
+	if(net_if_type == NET_IF_AMQP) {
+		amqp_basic_properties_t props;
+		props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG | AMQP_BASIC_DELIVERY_MODE_FLAG;
+		props.content_type = amqp_cstring_bytes("application/x-appletalk-packet");
+		props.delivery_mode = 2; /* persistent delivery mode */
+		amqp_bytes_t messageBody;
+		messageBody.len = len;
+		messageBody.bytes = packet;
+		if(amqp_basic_publish(amqp_connection, 1, amqp_cstring_bytes(amqp_exchange), amqp_cstring_bytes("basilisk_ii"), 0, 0, &props, messageBody) < 0)
+			WarningAlert("Unable to publish packet to AMQP server");
+		return noErr;
+	} else
 	if (write(fd, packet, len) < 0) {
 		D(bug("WARNING: Couldn't transmit packet\n"));
 		return excessCollsns;
@@ -854,6 +894,153 @@ void slirp_output(const uint8 *packet, int len)
 }
 #endif
 
+bool amqp_check_status(amqp_rpc_reply_t status, char const *context) {
+	char str[256];
+	switch (status.reply_type) {
+		case AMQP_RESPONSE_NORMAL:
+			return true;
+
+		case AMQP_RESPONSE_NONE:
+			snprintf(str, sizeof(str), "%s: missing RPC reply type", context);
+			WarningAlert(str);
+			break;
+
+		case AMQP_RESPONSE_LIBRARY_EXCEPTION:
+			snprintf(str, sizeof(str), "%s: %s", context, amqp_error_string2(status.library_error));
+			WarningAlert(str);
+			break;
+
+		case AMQP_RESPONSE_SERVER_EXCEPTION:
+			switch (status.reply.id) {
+				case AMQP_CONNECTION_CLOSE_METHOD: {
+					amqp_connection_close_t *m = (amqp_connection_close_t*)status.reply.decoded;
+					snprintf(str, sizeof(str), "%s: server connection error %uh, message: %.*s", context, m->reply_code, (int)m->reply_text.len, m->reply_text.bytes);
+					WarningAlert(str);
+					break;
+				}
+				case AMQP_CHANNEL_CLOSE_METHOD: {
+					amqp_channel_close_t *m = (amqp_channel_close_t*)status.reply.decoded;
+					snprintf(str, sizeof(str), "%s: server channel error %uh, message: %.*s", context, m->reply_code, (int)m->reply_text.len, m->reply_text.bytes);
+					WarningAlert(str);
+					break;
+				}
+				default:
+					snprintf(str, sizeof(str), "%s: unknown server error, method id 0x%08X", context, status.reply.id);
+					WarningAlert(str);
+					break;
+			}
+			break;
+	}
+	return false;
+}
+
+// amqps?://user:password@hostname:port[/vhost]?exchange
+amqp_connection_state_t amqp_queue_connect(const char *url) {
+	amqp_connection_state_t connection = 0;
+	amqp_socket_t *socket = 0;
+	char *parsedUrl = (char*)alloca(strlen(url) + 1);
+	strcpy(parsedUrl, url);
+
+	bool useSSL = false;
+	char *password = (char*)"guest";
+	char *hostname = (char*)"localhost";
+	int port = 5671;
+	char *vhost = (char*)"/";
+	char *exchange = (char*)"appleshare";
+
+	if(strncmp(parsedUrl, "amqps", 5) == 0)
+		useSSL = true;
+	char *user = (char*)strstr(parsedUrl, "://");
+	if(user) {
+		user += 3; // skip past the ://
+		password = strchr(user, ':');
+		if(password) {
+			*(password++) = 0;
+			hostname = strchr(password, '@');
+			if(hostname) {
+				*(hostname++) = 0;
+				char *p = strchr(hostname, ':');
+				if(p) {
+					*(p++) = 0;
+					port = atoi(p);
+					if(port == 0) port = 5671;
+					vhost = strchr(p, '/');
+					if(vhost) {
+						p = strchr(vhost, '?');
+						if(p) {
+							*(p++) = 0;
+							exchange = p;
+						}
+					} else
+						vhost = (char*)"/";
+				}
+			} else
+				hostname = (char*)"localhost";
+		} else
+			password = (char*)"guest";
+	} else
+		user = (char*)"guest";
+
+	strncpy(amqp_exchange, exchange, sizeof(amqp_exchange));
+
+	connection = amqp_new_connection();
+
+	if(useSSL) {
+		socket = amqp_ssl_socket_new(connection);
+		amqp_ssl_socket_set_verify_peer(socket, 0);
+		amqp_ssl_socket_set_verify_hostname(socket, 1);
+	} else
+		socket = amqp_tcp_socket_new(connection);
+
+	if (socket == 0) {
+		WarningAlert("Can't create AMQP socket");
+		amqp_queue_disconnect(connection);
+		return 0;
+	}
+
+	if(amqp_socket_open(socket, hostname, port)) {
+		WarningAlert("Unable to open AMQP socket");
+		amqp_queue_disconnect(connection);
+		return 0;
+	}
+
+	amqp_rpc_reply_t status = amqp_login(connection, vhost, 0, 131072, 0, AMQP_SASL_METHOD_PLAIN, user, password);
+	if(amqp_check_status(status, "amqp_login") == false) {
+		amqp_queue_disconnect(connection);
+		return 0;
+	}
+
+	amqp_channel_open(connection, 1);
+	status = amqp_get_rpc_reply(connection);
+	if(amqp_check_status(status, "amqp_channel_open") == false) {
+		amqp_queue_disconnect(connection);
+		return 0;
+	}
+
+	amqp_exchange_declare(connection, 1, amqp_cstring_bytes(exchange), amqp_cstring_bytes("fanout"), 0, 0, 0, 0, amqp_empty_table);
+	status = amqp_get_rpc_reply(connection);
+	if(amqp_check_status(status, "amqp_exchange_declare") == false) {
+		amqp_queue_disconnect(connection);
+		return 0;
+	}
+
+	D(bug("Connected to AMQP server %s:%d\n", hostname, port));
+	return connection;
+}
+
+void amqp_queue_disconnect(amqp_connection_state_t connection) {
+	if(connection != 0) {
+		amqp_rpc_reply_t status = amqp_channel_close(amqp_connection, 1, AMQP_REPLY_SUCCESS);
+		if(amqp_check_status(status, "amqp_channel_close")) {
+			status = amqp_connection_close(amqp_connection, AMQP_REPLY_SUCCESS);
+			if(amqp_check_status(status, "amqp_connection_close")) {
+				if(amqp_destroy_connection(amqp_connection) < 0)
+					WarningAlert("Unable to destroy AMQP connection");
+			}
+		}
+	}
+}
+
 
 /*
  *  Packet reception thread
@@ -861,28 +1048,81 @@ void slirp_output(const uint8 *packet, int len)
 
 static void *receive_func(void *arg)
 {
+	amqp_connection_state_t readQueue = 0;
+	if(net_if_type == NET_IF_AMQP) {
+		readQueue = amqp_queue_connect(PrefsFindString("ether"));
+		if(readQueue == 0)
+			return 0;
+		amqp_queue_declare_ok_t *r = amqp_queue_declare(readQueue, 1, amqp_empty_bytes, 0, 0, 0, 1, amqp_empty_table);
+		amqp_rpc_reply_t status = amqp_get_rpc_reply(readQueue);
+		if(amqp_check_status(status, "amqp_queue_declare") == false) {
+			amqp_queue_disconnect(readQueue);
+			return 0;
+		}
+
+		amqp_bytes_t queueName = amqp_bytes_malloc_dup(r->queue);
+		if (queueName.bytes == 0) {
+			WarningAlert("Out of memory while copying queue name");
+			amqp_queue_disconnect(readQueue);
+			return 0;
+		}
+
+		D(bug("Listening for message on queue: %.*s\n", (int)queueName.len, queueName.bytes));
+
+		amqp_queue_bind(readQueue, 1, queueName, amqp_cstring_bytes(amqp_exchange), amqp_cstring_bytes("*"), amqp_empty_table);
+		status = amqp_get_rpc_reply(readQueue);
+		if(amqp_check_status(status, "amqp_queue_bind") == false) {
+			amqp_queue_disconnect(readQueue);
+			return 0;
+		}
+
+		amqp_basic_consume(readQueue, 1, queueName, amqp_empty_bytes, 0, 1, 0, amqp_empty_table);
+		status = amqp_get_rpc_reply(readQueue);
+		if(amqp_check_status(status, "amqp_basic_consume") == false) {
+			amqp_queue_disconnect(readQueue);
+			return 0;
+		}
+
+		amqp_envelope = (amqp_envelope_t*)malloc(sizeof(amqp_envelope_t));
+	}
+
 	for (;;) {
 
-		// Wait for packets to arrive
+		if(net_if_type == NET_IF_AMQP && readQueue != 0) {
+			amqp_maybe_release_buffers(readQueue);
+
+			amqp_rpc_reply_t res = amqp_consume_message(readQueue, amqp_envelope, 0, 0);
+			if (AMQP_RESPONSE_NORMAL != res.reply_type) {
+				printf("AMQP error\n");
+				break;
+			}
+
+			if(strncmp((char*)amqp_envelope->routing_key.bytes, "basilisk_ii", amqp_envelope->routing_key.len) == 0) {
+				amqp_destroy_envelope(amqp_envelope);
+				continue;
+			}
+		} else {
+			// Wait for packets to arrive
 #if USE_POLL
-		struct pollfd pf = {fd, POLLIN, 0};
-		int res = poll(&pf, 1, -1);
+			struct pollfd pf = {fd, POLLIN, 0};
+			int res = poll(&pf, 1, -1);
 #else
-		fd_set rfds;
-		FD_ZERO(&rfds);
-		FD_SET(fd, &rfds);
-		// A NULL timeout could cause select() to block indefinitely,
-		// even if it is supposed to be a cancellation point [MacOS X]
-		struct timeval tv = { 0, 20000 };
-		int res = select(fd + 1, &rfds, NULL, NULL, &tv);
+			fd_set rfds;
+			FD_ZERO(&rfds);
+			FD_SET(fd, &rfds);
+			// A NULL timeout could cause select() to block indefinitely,
+			// even if it is supposed to be a cancellation point [MacOS X]
+			struct timeval tv = { 0, 20000 };
+			int res = select(fd + 1, &rfds, NULL, NULL, &tv);
 #ifdef HAVE_PTHREAD_TESTCANCEL
-		pthread_testcancel();
+			pthread_testcancel();
 #endif
-		if (res == 0 || (res == -1 && errno == EINTR))
-			continue;
+			if (res == 0 || (res == -1 && errno == EINTR))
+				continue;
 #endif
-		if (res <= 0)
-			break;
+			if (res <= 0)
+				break;
+		}
 
 		if (ether_driver_opened) {
 			// Trigger Ethernet interrupt
@@ -895,6 +1135,17 @@ static void *receive_func(void *arg)
 		} else
 			Delay_usec(20000);
 	}
+
+	if(readQueue != 0) {
+		amqp_queue_disconnect(readQueue);
+		readQueue = 0;
+	}
+
+	if(amqp_envelope != 0) {
+		free(amqp_envelope);
+		amqp_envelope = 0;
+	}
+
 	return NULL;
 }
 
@@ -924,6 +1175,12 @@ void ether_do_interrupt(void)
 
 		} else
 #endif
+		if(net_if_type == NET_IF_AMQP && amqp_envelope->message.body.len <= 1514) {
+			memcpy(Mac2HostAddr(packet), amqp_envelope->message.body.bytes, amqp_envelope->message.body.len);
+			ether_dispatch_packet(packet, amqp_envelope->message.body.len);
+			amqp_destroy_envelope(amqp_envelope);
+			break;
+		} else
 		{
 
 			// Read packet from sheep_net device
