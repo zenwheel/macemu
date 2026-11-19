@@ -96,6 +96,9 @@
 // Always use the complete non-stubs Ethernet driver
 #define USE_ETHER_FULL_DRIVER 1
 
+// BSD socket API supported
+#define SUPPORTS_UDP_TUNNEL 1
+
 #define POWERPC_ROM 1
 
 #if EMULATED_PPC

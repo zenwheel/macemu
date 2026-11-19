@@ -51,6 +51,9 @@ extern void OTLeaveInterrupt(void);
 extern void ether_dispatch_packet(uint32 p, uint32 length);
 extern void ether_packet_received(mblk_t *mp);
 
+extern bool ether_start_udp_thread(int socket_fd);
+extern void ether_stop_udp_thread(void);
+
 extern bool ether_driver_opened;
 
 // Ethernet packet allocator (optimized for 32-bit platforms in real addressing mode)
