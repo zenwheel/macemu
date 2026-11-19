@@ -128,6 +128,11 @@ extern "C" {
 #endif // END OF #ifdef __x86_64__
 
 #ifdef __aarch64__
+
+#if __DARWIN_UNIX03 && defined _STRUCT_ARM_EXCEPTION_STATE64
+#define MACH_FIELD_NAME(X)				__CONCAT(__,X)
+#endif // END OF #if __DARWIN_UNIX03 && defined _STRUCT_ARM_EXCEPTION_STATE64
+
 #define SIGSEGV_EXCEPTION_STATE_TYPE	arm_exception_state64_t
 #define SIGSEGV_EXCEPTION_STATE_FLAVOR	ARM_EXCEPTION_STATE64
 #define SIGSEGV_EXCEPTION_STATE_COUNT	ARM_EXCEPTION_STATE64_COUNT
@@ -135,6 +140,7 @@ extern "C" {
 #define SIGSEGV_THREAD_STATE_TYPE		arm_thread_state64_t
 #define SIGSEGV_THREAD_STATE_FLAVOR		ARM_THREAD_STATE64
 #define SIGSEGV_THREAD_STATE_COUNT		ARM_THREAD_STATE64_COUNT
+#define SIGSEGV_FAULT_INSTRUCTION		SIP->thr_state.MACH_FIELD_NAME(pc)
 #define SIGSEGV_REGISTER_FILE			((SIGSEGV_REGISTER_TYPE *)&SIP->thr_state.MACH_FIELD_NAME(x[0])) /* x[0] is the first GPR we consider */
 #define SIGSEGV_SKIP_INSTRUCTION		aarch64_skip_instruction
 #endif // END OF #ifdef __arm64__

@@ -57,13 +57,13 @@ AC_ARG_WITH(libvhd,
 
 dnl Addressing mode
 AC_ARG_ENABLE(addressing,
-  [  --enable-addressing=AM  set the addressing mode to use [default=real]],
+  [  --enable-addressing=AM  set the addressing mode to use [default=real, or direct where Low Memory can't be mapped on Darwin]],
   [case "$enableval" in
    real)        WANT_ADDRESSING_MODE="real";;
    direct)      WANT_ADDRESSING_MODE="direct";;
    direct,0x*)  WANT_ADDRESSING_MODE="direct"; NATMEM_OFFSET=`echo "$enableval" | sed -n '/direct,\(0[[xX]][[0-9A-Fa-f]]*\([[UuLl]]\{1,2\}\)\?\)$/s//\1/p'`;;
    esac],
-  [WANT_ADDRESSING_MODE="real"]
+  [WANT_ADDRESSING_MODE="default"]
 )
 
 dnl SDL options.
@@ -1222,6 +1222,21 @@ else
     WANT_VOSF=no
 fi
 
+dnl Real addressing needs the Low Memory globals at address 0. Like Basilisk II,
+dnl don't use it by default on Darwin when they can't be mapped there (arm64
+dnl doesn't allow either the __PAGEZERO hack or mapping page 0); on Linux the
+dnl lowest mappable address is a run-time setting (vm.mmap_min_addr).
+if [[ "$WANT_ADDRESSING_MODE" = "default" ]]; then
+  WANT_ADDRESSING_MODE="real"
+  case "$target_os" in
+  darwin*)
+    if [[ "x$ac_cv_can_map_lm$ac_cv_pagezero_hack" = "xnono" ]]; then
+      WANT_ADDRESSING_MODE="direct"
+    fi
+    ;;
+  esac
+fi
+
 dnl Check addressing mode to use
 AC_MSG_CHECKING([for addressing mode to use])
 if [[ "$EMULATED_PPC" != "yes" ]]; then
@@ -1241,6 +1256,21 @@ if [[ "$WANT_ADDRESSING_MODE" = "direct" ]]; then
 #include <stdio.h>
 #include <string.h>
 #include "../CrossPlatform/vm_alloc.cpp"
+
+static unsigned long next_offset(unsigned long ofs)
+{
+	if (ofs < 0x90000000)
+		return ofs + 0x10000000;
+#if SIZEOF_VOID_P == 8
+	// Some 64-bit hosts can't map anything below 4 GB (Darwin/arm64, which
+	// also reserves 4-448 GB for the program and the shared libraries)
+	if (ofs < 0x10000000000UL)
+		return 0x10000000000UL;
+	if (ofs < 0x10f00000000UL)
+		return ofs + 0x100000000UL;
+#endif
+	return 0;
+}
 
 int main(void)
 {
@@ -1265,7 +1295,7 @@ int main(void)
 #ifdef NATMEM_OFFSET
 	unsigned long ofs = NATMEM_OFFSET;
 #else
-	for (unsigned long ofs = 0x10000000; ofs <= 0x90000000; ofs += 0x10000000)
+	for (unsigned long ofs = 0x10000000; ofs != 0; ofs = next_offset(ofs))
 #endif
 	for (int i = 0; i < n_ranges; i++) {
 		char *m = (char *)(ranges[[i]].base + ofs);
@@ -1277,7 +1307,7 @@ int main(void)
 			if (sizeof(void *) == 8 && ofs > 0xffffffff)
 				printf("0x%lxul\n", ofs);
 			else
-				printf("0x%08x\n", ofs);
+				printf("0x%08lx\n", ofs);
 			return 0;
 		}
 	}
