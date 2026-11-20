@@ -369,7 +369,9 @@ See the next item for an alternative way to do networking with Basilisk II.
 udptunnel <"true" or "false">
 ```
 
-Setting this to `true` enables a special network mode in which all network packets sent by MacOS are tunnelled over UDP using the host operating system's native TCP/IP stack. This can only be used to connect computers running Basilisk II (and not, for example, for connecting to the Internet or an AppleShare server running on a real Mac), but it is probably the easiest way to set up a network between two instances of Basilisk II because the UDP tunnelling doesn't require any special kernel modules or network add-ons. It relies on IP broadcasting, however, so its range is limited. It should be fine though for doing a little file sharing or playing Spectre.
+Setting this to `true` enables a special network mode in which all network packets sent by MacOS are tunnelled over UDP using the host operating system's native TCP/IP stack. This can only be used to connect computers running Basilisk II or SheepShaver (and not, for example, for connecting to the Internet or an AppleShare server running on a real Mac), but it is probably the easiest way to set up a network between two instances of Basilisk II because the UDP tunnelling doesn't require any special kernel modules or network add-ons. It relies on IP broadcasting, however, so its range is limited to the local IPv4 subnet (it does work over Wi-Fi). It should be fine though for doing a little file sharing or playing Spectre.
+
+Only one copy of Basilisk II or SheepShaver per IP address can use the tunnel, because the UDP port is bound exclusively and the Ethernet address MacOS sees is derived from the IP address. SheepShaver's Unix version supports the same `udptunnel` and `udpport` settings, so the two can share an AppleTalk network.
 
 ## udpport
 ```

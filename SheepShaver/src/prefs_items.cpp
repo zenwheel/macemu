@@ -50,6 +50,8 @@ prefs_desc common_prefs_items[] = {
 	{"gfxaccel", TYPE_BOOLEAN, false,   "turn on QuickDraw acceleration"},
 	{"nocdrom", TYPE_BOOLEAN, false,    "don't install CD-ROM driver"},
 	{"nonet", TYPE_BOOLEAN, false,      "don't use Ethernet"},
+	{"udptunnel", TYPE_BOOLEAN, false,  "tunnel all network packets over UDP"},
+	{"udpport", TYPE_INT32, false,      "IP port number for tunneling"},
 	{"nosound", TYPE_BOOLEAN, false,    "don't enable sound output"},
 	{"nogui", TYPE_BOOLEAN, false,      "disable GUI"},
 	{"noclipconversion", TYPE_BOOLEAN, false, "don't convert clipboard contents"},
@@ -77,6 +79,8 @@ void AddPrefsDefaults(void)
 	PrefsAddBool("gfxaccel", true);
 	PrefsAddBool("nocdrom", false);
 	PrefsAddBool("nonet", false);
+	PrefsAddBool("udptunnel", false);
+	PrefsAddInt32("udpport", 6066);
 	PrefsAddBool("nosound", false);
 	PrefsAddBool("nogui", false);
 	PrefsAddBool("noclipconversion", false);

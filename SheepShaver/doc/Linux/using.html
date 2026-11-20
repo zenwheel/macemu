@@ -25,7 +25,7 @@ requires a DGA capable X server.
 
 <H2>Networking</H2>
 
-There are three approaches to networking with SheepShaver:
+There are four approaches to networking with SheepShaver:
 
 <OL>
 <LI>Direct access to an Ethernet card via the "sheep_net" driver.
@@ -81,6 +81,27 @@ your network administrator about the nets and zones you can use
 <LI>Networking protocols for serial connections (PPP and SLIP, for example)
 can be used provided that you have the appropriate MacOS system components
 installed (e.g. Open Transport/PPP).
+
+<LI>Tunnelling all network packets over UDP. This is the same "UDP tunnel"
+mode that Basilisk II has, so SheepShaver and Basilisk II can share an
+AppleTalk network (for AppleShare file sharing or network games) without
+root privileges, special drivers or bridging. It is enabled by adding these
+lines to the prefs file (<CODE>~/.sheepshaver_prefs</CODE>):
+
+<PRE>
+udptunnel true
+udpport 6066
+</PRE>
+
+(6066 is the default port; all copies on the network must use the same one).
+The "ethernet card description" is ignored in this mode. Each Ethernet frame
+is sent as a UDP datagram, to the peer's IP address or as an IP broadcast,
+which limits the network to the local IPv4 subnet, but it does work over
+Wi-Fi. Only one copy of SheepShaver or Basilisk II per IP address can use the
+tunnel, because the port is bound exclusively and the Ethernet address
+MacOS sees is derived from the IP address. Connecting to the Internet or to
+real Macs is not possible this way, unless another program (an AppleTalk
+router, for example) bridges the UDP tunnel to a real network.
 </OL>
 
 <H2>Using floppy disks</H2>

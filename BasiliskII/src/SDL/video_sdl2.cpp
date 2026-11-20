@@ -217,8 +217,20 @@ extern void SysMountFirstFloppy(void);
 
 static void *vm_acquire_framebuffer(uint32 size)
 {
+#if VM_WRAP_MAC_ADDRESS
+	// The Mac address space lies above 4 GB on the host, so the frame buffer
+	// can't just be any 32-bit address: put it at the first free Mac address
+	// from 0x80000000 up (where PCI video memory would be on a real Mac)
+	for (uint32 addr = 0x80000000; addr < 0xf0000000; addr += 0x01000000) {
+		void *fb = Mac2HostAddr(addr);
+		if (vm_acquire_fixed(fb, size, VM_MAP_DEFAULT) == 0)
+			return fb;
+	}
+	return VM_MAP_FAILED;
+#else
 	void *fb = vm_acquire(size, VM_MAP_DEFAULT | VM_MAP_32BIT);
 	return fb;
+#endif
 }
 
 static inline void vm_release_framebuffer(void *fb, uint32 size)

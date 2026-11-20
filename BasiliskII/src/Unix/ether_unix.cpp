@@ -43,6 +43,9 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <netinet/in.h>
+#if defined(SHEEPSHAVER) && SUPPORTS_UDP_TUNNEL
+#include <netdb.h>
+#endif
 #include <pthread.h>
 #include <semaphore.h>
 #include <errno.h>
@@ -128,6 +131,10 @@ static VDECONN *vde_conn;
 #ifdef SHEEPSHAVER
 static bool net_open = false;				// Flag: initialization succeeded, network device open
 static uint8 ether_addr[6];					// Our Ethernet address
+#if SUPPORTS_UDP_TUNNEL
+static int udp_socket = -1;					// Socket for tunnelling AppleTalk over UDP
+static uint16 udp_port;						// UDP port of all tunnel peers
+#endif
 #else
 const bool ether_driver_opened = true;		// Flag: is the MacOS driver opened?
 #endif
@@ -549,6 +556,130 @@ enum {
 	excessCollsns	= -95
 };
 
+#if SUPPORTS_UDP_TUNNEL
+/*
+ *  Tunnelling AppleTalk over UDP, compatible with Basilisk II's "udptunnel":
+ *  every Ethernet frame is sent as one UDP datagram to the peer whose IP
+ *  address is encoded in the 'B' '2' destination MAC, or broadcast
+ */
+
+// Open UDP socket and derive our Ethernet address from our IP address
+static bool ether_udp_init(void)
+{
+	udp_port = PrefsFindInt32("udpport");
+
+	// Open UDP socket
+	udp_socket = socket(PF_INET, SOCK_DGRAM, 0);
+	if (udp_socket < 0) {
+		perror("socket");
+		return false;
+	}
+
+	// Bind to specified address and port
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = INADDR_ANY;
+	sa.sin_port = htons(udp_port);
+	if (bind(udp_socket, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		perror("bind");
+		close(udp_socket);
+		udp_socket = -1;
+		return false;
+	}
+
+	// Retrieve local IP address (or at least one of them)
+	socklen_t sa_length = sizeof(sa);
+	getsockname(udp_socket, (struct sockaddr *)&sa, &sa_length);
+	uint32 udp_ip = sa.sin_addr.s_addr;
+	if (udp_ip == INADDR_ANY || udp_ip == INADDR_LOOPBACK) {
+		char name[256];
+		gethostname(name, sizeof(name));
+		struct hostent *local = gethostbyname(name);
+		if (local)
+			udp_ip = *(uint32 *)local->h_addr_list[0];
+	}
+	udp_ip = ntohl(udp_ip);
+
+	// Construct dummy Ethernet address from local IP address
+	ether_addr[0] = 'B';
+	ether_addr[1] = '2';
+	ether_addr[2] = udp_ip >> 24;
+	ether_addr[3] = udp_ip >> 16;
+	ether_addr[4] = udp_ip >> 8;
+	ether_addr[5] = udp_ip;
+	D(bug("Ethernet address %02x %02x %02x %02x %02x %02x\n", ether_addr[0], ether_addr[1], ether_addr[2], ether_addr[3], ether_addr[4], ether_addr[5]));
+
+	// Set socket options
+	int on = 1;
+	setsockopt(udp_socket, SOL_SOCKET, SO_BROADCAST, &on, sizeof(on));
+	ioctl(udp_socket, FIONBIO, &on);
+
+	// Start thread for packet reception
+	if (!ether_start_udp_thread(udp_socket)) {
+		close(udp_socket);
+		udp_socket = -1;
+		return false;
+	}
+	return true;
+}
+
+// Stop reception thread and close UDP socket
+static void ether_udp_exit(void)
+{
+	if (udp_socket >= 0) {
+		ether_stop_udp_thread();
+		close(udp_socket);
+		udp_socket = -1;
+	}
+	udp_tunnel = false;
+}
+
+// Check whether Ethernet address is AppleTalk or Ethernet broadcast address
+static inline bool is_apple_talk_broadcast(uint8 *p)
+{
+	return p[0] == 0x09 && p[1] == 0x00 && p[2] == 0x07
+	    && p[3] == 0xff && p[4] == 0xff && p[5] == 0xff;
+}
+
+static inline bool is_ethernet_broadcast(uint8 *p)
+{
+	return p[0] == 0xff && p[1] == 0xff && p[2] == 0xff
+	    && p[3] == 0xff && p[4] == 0xff && p[5] == 0xff;
+}
+
+// Send Ethernet frame to the tunnel peer(s) its destination address selects
+static int16 ether_udp_write(uint8 *packet, int len)
+{
+	if (len < 14)
+		return eLenErr;	// Header incomplete
+
+	// Set source address
+	memcpy(packet + 6, ether_addr, 6);
+
+	// Extract destination address
+	uint32 dest_ip;
+	if (packet[0] == 'B' && packet[1] == '2')
+		dest_ip = (packet[2] << 24) | (packet[3] << 16) | (packet[4] << 8) | packet[5];
+	else if (is_apple_talk_broadcast(packet) || is_ethernet_broadcast(packet))
+		dest_ip = INADDR_BROADCAST;
+	else
+		return eMultiErr;
+
+	// Send packet
+	struct sockaddr_in sa;
+	memset(&sa, 0, sizeof(sa));
+	sa.sin_family = AF_INET;
+	sa.sin_addr.s_addr = htonl(dest_ip);
+	sa.sin_port = htons(udp_port);
+	if (sendto(udp_socket, packet, len, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		D(bug("WARNING: Couldn't transmit packet\n"));
+		return excessCollsns;
+	}
+	return noErr;
+}
+#endif
+
 // Initialize ethernet
 void EtherInit(void)
 {
@@ -558,13 +689,26 @@ void EtherInit(void)
 	if (PrefsFindBool("nonet"))
 		return;
 
+#if SUPPORTS_UDP_TUNNEL
+	// UDP tunnelling requested?
+	if (PrefsFindBool("udptunnel")) {
+		net_open = ether_udp_init();
+		return;
+	}
+#endif
+
 	net_open = ether_init();
 }
 
 // Exit ethernet
 void EtherExit(void)
 {
-	ether_exit();
+#if SUPPORTS_UDP_TUNNEL
+	if (udp_tunnel)
+		ether_udp_exit();
+	else
+#endif
+		ether_exit();
 	net_open = false;
 }
 
@@ -809,6 +953,10 @@ static int16 ether_do_write(uint32 arg)
 #endif
 
 	// Transmit packet
+#if defined(SHEEPSHAVER) && SUPPORTS_UDP_TUNNEL
+	if (udp_tunnel)
+		return ether_udp_write(packet, len);
+#endif
 #ifdef HAVE_SLIRP
 	if (net_if_type == NET_IF_SLIRP) {
 		const int slirp_input_fd = slirp_input_fds[1];
@@ -1006,6 +1154,30 @@ void ether_do_interrupt(void)
 			if (length < 14)
 				break;
 			ether_udp_read(packet, length, &from);
+
+		} else
+#elif SUPPORTS_UDP_TUNNEL
+		if (udp_tunnel) {
+
+			// Read packet from socket
+			length = recv(fd, Mac2HostAddr(packet), 1514, 0);
+			if (length < 14)
+				break;
+
+			// Drop packets sent by us
+			if (memcmp(Mac2HostAddr(packet) + 6, ether_addr, 6) == 0)
+				continue;
+
+#if MONITOR
+			bug("Receiving Ethernet packet:\n");
+			for (int i=0; i<length; i++) {
+				bug("%02x ", ReadMacInt8(packet + i));
+			}
+			bug("\n");
+#endif
+
+			// Dispatch packet
+			ether_dispatch_packet(packet, length);
 
 		} else
 #endif

@@ -2512,12 +2512,61 @@ static bool arm_skip_instruction(unsigned long * regs)
 }
 #endif
 
-#if (defined(__aarch64__) && defined(__APPLE__))
-static bool aarch64_skip_instruction(unsigned long *regs) {
-    _STRUCT_ARM_THREAD_STATE64 *ts = (_STRUCT_ARM_THREAD_STATE64 *)regs;
-    if (!ts->__pc) return false;
-    ts->__pc += 4;
-    return true;
+#if (defined(aarch64) || defined(__aarch64__))
+// Both the Linux sigcontext and the Darwin arm_thread_state64 hold
+// x0-x30, then sp, then pc
+enum {
+  AARCH64_REG_SP = 31,
+  AARCH64_REG_PC = 32
+};
+
+// Skip the faulting load/store: loads into general purpose registers
+// yield zero, and pre/post-index base register writeback is performed
+static bool aarch64_skip_instruction(unsigned long *regs)
+{
+  uint32_t *pc = (uint32_t *)regs[AARCH64_REG_PC];
+  if (pc == 0)
+	return false;
+  const uint32_t opcode = *pc;
+  const int rt = opcode & 0x1f;
+  const int rn = (opcode >> 5) & 0x1f;
+  const bool simd = (opcode >> 26) & 1;
+
+  if ((opcode & 0x3a000000) == 0x38000000) {
+	// Load/store register (unscaled, pre/post-indexed, unsigned offset, register offset)
+	const int size = opcode >> 30;
+	const int opc = (opcode >> 22) & 3;
+	const bool is_load = opc != 0 && !(size == 3 && opc == 2 && !simd);	// size 3, opc 2 is PRFM
+	if (is_load && !simd && rt != 31)
+	  regs[rt] = 0;
+	if (((opcode >> 24) & 1) == 0 && ((opcode >> 21) & 1) == 0) {
+	  const int mode = (opcode >> 10) & 3;
+	  if (mode == 1 || mode == 3) {	// post-index or pre-index
+		const long imm9 = (int32_t)(opcode << 11) >> 23;
+		regs[rn] += imm9;
+	  }
+	}
+  } else if ((opcode & 0x3a000000) == 0x28000000) {
+	// Load/store register pair
+	const bool is_load = (opcode >> 22) & 1;
+	const int rt2 = (opcode >> 10) & 0x1f;
+	if (is_load && !simd) {
+	  if (rt != 31)
+		regs[rt] = 0;
+	  if (rt2 != 31)
+		regs[rt2] = 0;
+	}
+	const int mode = (opcode >> 23) & 3;
+	if (mode == 1 || mode == 3) {	// post-index or pre-index
+	  const int opc = opcode >> 30;
+	  const int scale = simd ? 4 << opc : (opc & 2) ? 8 : 4;
+	  const long imm7 = (int32_t)(opcode << 10) >> 25;
+	  regs[rn] += imm7 * scale;
+	}
+  }
+
+  regs[AARCH64_REG_PC] += 4;
+  return true;
 }
 #endif
 

@@ -195,7 +195,13 @@ const uintptr VMBaseDiff = NATMEM_OFFSET;
 #endif
 // Wrap address to 32-bit if we are not using 33-bit addressing space
 #if defined(SHEEPSHAVER) && SIZEOF_VOID_P == 8
+#if defined(NATMEM_OFFSET) && NATMEM_OFFSET > 0xffffffff
+// The Mac address space lies above 4 GB on the host (e.g. Darwin/arm64,
+// which doesn't allow mappings below 4 GB): wrap the Mac address instead
+#define VM_WRAP_MAC_ADDRESS 1
+#else
 #define vm_wrap_address(ADDR) (uintptr)(uint32)(ADDR)
+#endif
 #endif
 #endif
 #ifndef vm_wrap_address
@@ -203,6 +209,16 @@ const uintptr VMBaseDiff = NATMEM_OFFSET;
 #endif
 
 #if REAL_ADDRESSING || DIRECT_ADDRESSING
+#if VM_WRAP_MAC_ADDRESS
+static inline uint8 * vm_do_get_real_address(vm_addr_t addr)
+{
+	return (uint8 *)(VMBaseDiff + (uint32)addr);
+}
+static inline vm_addr_t vm_do_get_virtual_address(uint8 *addr)
+{
+	return (uint32)((uintptr)addr - VMBaseDiff);
+}
+#else
 static inline uint8 * vm_do_get_real_address(vm_addr_t addr)
 {
 	return (uint8 *)vm_wrap_address(VMBaseDiff + addr);
@@ -211,6 +227,7 @@ static inline vm_addr_t vm_do_get_virtual_address(uint8 *addr)
 {
 	return vm_wrap_address((uintptr)addr - VMBaseDiff);
 }
+#endif
 static inline uint32 vm_read_memory_1(vm_addr_t addr)
 {
 	uint8 * const m = vm_do_get_real_address(addr);
