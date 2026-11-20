@@ -94,6 +94,11 @@ AC_ARG_WITH(vdeplug,
   [],
   [with_vdeplug=yes])
 
+AC_ARG_WITH(rabbitmq,
+  AS_HELP_STRING([--with-rabbitmq], [Enable AMQP virtual network support (librabbitmq)]),
+  [],
+  [with_rabbitmq=yes])
+
   
 dnl Cross Compiling results in 'guesses' being made about the target system. These defaults are oftetimes incorrect.
 dnl The following Environment variables allow you to configure the default guess value for each option in the configure script.
@@ -839,6 +844,15 @@ have_vdeplug=no
 AS_IF([test "x$with_vdeplug" = "xyes"], [
   have_vdeplug=yes
   AC_CHECK_LIB(vdeplug, vde_close, [], [have_vdeplug=no])
+])
+
+dnl Is librabbitmq available (for AMQP Ethernet)?
+have_rabbitmq=no
+AS_IF([test "x$with_rabbitmq" = "xyes"], [
+  AC_CHECK_HEADERS([rabbitmq-c/amqp.h amqp.h], [have_rabbitmq=yes; break])
+  AS_IF([test "x$have_rabbitmq" = "xyes"], [
+    AC_CHECK_LIB(rabbitmq, amqp_new_connection, [], [have_rabbitmq=no])
+  ])
 ])
 
 if [[ "x$WANT_MACOSX_GUI" = "xyes" ]]; then
@@ -1917,6 +1931,7 @@ echo SDL major-version ...................... : $WANT_SDL_VERSION_MAJOR
 echo BINCUE support ......................... : $have_bincue
 echo LIBVHD support ......................... : $have_libvhd
 echo VDE support ............................ : $have_vdeplug
+echo AMQP support ........................... : $have_rabbitmq
 echo XFree86 DGA support .................... : $WANT_XF86_DGA
 echo XFree86 VidMode support ................ : $WANT_XF86_VIDMODE
 echo fbdev DGA support ...................... : $WANT_FBDEV_DGA
